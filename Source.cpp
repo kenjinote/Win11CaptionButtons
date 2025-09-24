@@ -54,6 +54,58 @@ COLORREF g_iconColor = RGB(0, 0, 0);
 
 // -----------------------------------------
 
+bool IsAppsUseLightTheme()
+{
+    HKEY hKey = NULL;
+    DWORD value = 1; // デフォルトはライト
+    DWORD dataSize = sizeof(value);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER,
+        L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+        0, KEY_READ, &hKey) == ERROR_SUCCESS)
+    {
+        RegGetValueW(hKey, NULL, L"AppsUseLightTheme", RRF_RT_REG_DWORD, NULL, &value, &dataSize);
+        RegCloseKey(hKey);
+    }
+    return value != 0;
+}
+
+void EnableDarkModeForWindow(HWND hwnd, bool enable)
+{
+    BOOL useDark = enable ? TRUE : FALSE;
+    // 属性 ID のフォールバック（環境により 20 または 19 を使う実装）
+    const DWORD attrs[] = { 20, 19 }; // 20 が標準的だが環境によっては 19
+    HRESULT hr = E_FAIL;
+    for (int i = 0; i < _countof(attrs); ++i) {
+        hr = DwmSetWindowAttribute(hwnd, attrs[i], &useDark, sizeof(useDark));
+        if (SUCCEEDED(hr)) break;
+    }
+    // デバッグ出力（失敗するときに役立つ）
+    if (FAILED(hr)) {
+        wchar_t buf[128];
+        swprintf_s(buf, L"EnableDarkModeForWindow: DwmSetWindowAttribute failed: 0x%08X\n", hr);
+        OutputDebugStringW(buf);
+    }
+}
+
+// ダークモード有効化ヘルパー
+void EnableDarkMode(HWND hwnd, bool enable)
+{
+    BOOL useDark = enable ? TRUE : FALSE;
+    HRESULT hr = DwmSetWindowAttribute(
+        hwnd,
+        DWMWA_USE_IMMERSIVE_DARK_MODE,
+        &useDark,
+        sizeof(useDark)
+    );
+
+    if (FAILED(hr)) {
+        // デバッグ用: 失敗したらエラーコードを確認
+        wchar_t buf[128];
+        swprintf_s(buf, L"DwmSetWindowAttribute failed: 0x%08X\n", hr);
+        OutputDebugStringW(buf);
+    }
+}
+
 // ダークモード判定（Win11対応）
 bool IsDarkMode(HWND hwnd)
 {
@@ -240,10 +292,12 @@ void OnPaint(HWND hwnd)
     RECT rcWnd; GetClientRect(hwnd, &rcWnd);
 
     // 背景クリア
-    if (IsDarkMode(hwnd))
-        g_pRT->Clear(D2D1::ColorF(0.11f, 0.11f, 0.11f, 1.0f));
-    else
-        g_pRT->Clear(D2D1::ColorF(1, 1, 1, 1));
+    if (IsDarkMode(hwnd)) {
+        g_pRT->Clear(D2D1::ColorF(0.11f, 0.11f, 0.11f, 1.0f)); // ダーク背景
+    }
+    else {
+        g_pRT->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));   // ライト背景
+    }
 
     float btnIconSize = (float)TITLEBAR_HEIGHT * 0.35f;
     float stroke = 1.6f;
@@ -410,16 +464,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     {
         g_hWnd = hwnd;
 
-        // --- 重要: 標準のタイトルバーを削除して完全自作にする ---
+        // 標準のタイトルバー削除
         LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
-        style &= ~WS_CAPTION; // タイトルバーを消す
+        style &= ~WS_CAPTION;
         SetWindowLongPtr(hwnd, GWL_STYLE, style);
-        // フレーム変更を即反映
-        SetWindowPos(hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
 
+        // 初期テーマを適用
+        bool isLight = IsAppsUseLightTheme();
+        EnableDarkModeForWindow(hwnd, !isLight);
+        
         CreateDeviceResources(hwnd);
         RECT rc; GetClientRect(hwnd, &rc);
         LayoutButtons(rc.right);
+        break;
+    }
+    case WM_SETTINGCHANGE:
+    case WM_THEMECHANGED:
+    {
+        // OS の設定を読みなおして DWM 属性を再適用
+        bool isLight = IsAppsUseLightTheme();
+        EnableDarkModeForWindow(hwnd, !isLight);
+
+        // ブラシ等の色を更新して再作成 -> 再描画
+        UpdateColors(hwnd);
+        DiscardDeviceResources();
+        CreateDeviceResources(hwnd);
+        InvalidateRect(hwnd, NULL, TRUE);
         break;
     }
     case WM_SIZE:
@@ -557,6 +629,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmd)
 {
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     WNDCLASSW wc = {};
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInst;
