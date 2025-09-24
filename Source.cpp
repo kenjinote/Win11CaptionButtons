@@ -6,11 +6,24 @@
 #include <string>
 #pragma comment(lib, "d2d1.lib")
 
+#include <uxtheme.h>
+#include <dwmapi.h>
+#include <vssym32.h>
+
+#pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "dwmapi.lib")
+
+#include <dwrite.h>
+#pragma comment(lib, "dwrite.lib")
+
+#include "resource.h"
+
 // simple SafeRelease
 template<class T> void SafeRelease(T*& p) { if (p) { p->Release(); p = nullptr; } }
 
 // ----------------- 設定 -----------------
 constexpr int TITLEBAR_HEIGHT = 34; // タイトルバー高さ（px）
+#define BUTTON_WIDTH 46
 static HWND g_hWnd = nullptr;
 
 // Direct2D
@@ -20,6 +33,9 @@ static ID2D1SolidColorBrush* g_pBrushText = nullptr;
 static ID2D1SolidColorBrush* g_pBrushIcon = nullptr;
 static ID2D1SolidColorBrush* g_pBrushHover = nullptr;
 static ID2D1SolidColorBrush* g_pBrushPressed = nullptr;
+
+static IDWriteFactory* g_pDWriteFactory = nullptr;
+static IDWriteTextFormat* g_pTextFormat = nullptr;
 
 // ボタン状態
 struct ButtonState {
@@ -38,16 +54,19 @@ COLORREF g_iconColor = RGB(0, 0, 0);
 
 // -----------------------------------------
 
-bool IsDarkMode()
+// ダークモード判定（Win11対応）
+bool IsDarkMode(HWND hwnd)
 {
-    COLORREF clr = GetSysColor(COLOR_WINDOWTEXT);
-    int lum = (GetRValue(clr) * 299 + GetGValue(clr) * 587 + GetBValue(clr) * 114) / 1000;
-    return lum < 128;
+    BOOL dark = FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark)))) {
+        return dark;
+    }
+    return false;
 }
 
-void UpdateColors()
+void UpdateColors(HWND hWnd)
 {
-    if (IsDarkMode()) {
+    if (IsDarkMode(hWnd)) {
         g_textColor = RGB(255, 255, 255);
         g_iconColor = RGB(255, 255, 255);
     }
@@ -73,7 +92,7 @@ void CreateDeviceResources(HWND hwnd)
     SafeRelease(g_pBrushIcon);
     SafeRelease(g_pBrushHover);
     SafeRelease(g_pBrushPressed);
-    UpdateColors();
+    UpdateColors(hwnd);
     if (g_pRT) {
         g_pRT->CreateSolidColorBrush(D2D1::ColorF(
             GetRValue(g_textColor) / 255.0f,
@@ -193,64 +212,195 @@ void DrawCloseIcon(ID2D1RenderTarget* rt, D2D1_POINT_2F center, float size, ID2D
     rt->DrawLine(p3, p4, brush, strokeWidth);
 }
 
+void CreateTextFormat()
+{
+    if (!g_pDWriteFactory) {
+        DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED,
+            __uuidof(IDWriteFactory), (IUnknown**)&g_pDWriteFactory);
+    }
+    SafeRelease(g_pTextFormat);
+    if (g_pDWriteFactory) {
+        g_pDWriteFactory->CreateTextFormat(
+            L"Segoe UI", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 14.0f, L"ja-jp", &g_pTextFormat);
+    }
+}
+
 void OnPaint(HWND hwnd)
 {
     PAINTSTRUCT ps;
-    HDC hdc = BeginPaint(hwnd, &ps);
+    BeginPaint(hwnd, &ps);
 
     CreateDeviceResources(hwnd);
+    CreateTextFormat();
     if (!g_pRT) { EndPaint(hwnd, &ps); return; }
 
     g_pRT->BeginDraw();
-    // 背景: クライアント全体を背景色で塗る（タイトルは自前で塗る）
     RECT rcWnd; GetClientRect(hwnd, &rcWnd);
-    D2D1_RECT_F full = D2D1::RectF(0.0f, 0.0f, (FLOAT)rcWnd.right, (FLOAT)rcWnd.bottom);
-    // ここでは背景をウィンドウのクライアント色で塗る（透明にする場合は変更）
-    g_pRT->Clear(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f));
 
-    // タイトル領域は自前で描く（背景の有無は好みで調整）
-    D2D1_RECT_F titleRect = D2D1::RectF(0.0f, 0.0f, (FLOAT)rcWnd.right, (FLOAT)TITLEBAR_HEIGHT);
-    // 例: タイトル背景を透明にしてDWMの影を活かしたい場合は Fill をしない
-    // g_pRT->FillRectangle(titleRect, g_pBrushText); // 使わない
+    // 背景クリア
+    if (IsDarkMode(hwnd))
+        g_pRT->Clear(D2D1::ColorF(0.11f, 0.11f, 0.11f, 1.0f));
+    else
+        g_pRT->Clear(D2D1::ColorF(1, 1, 1, 1));
 
-    // タイトル文字（ここでは簡易に GDI で描画）
-    std::wstring title = L"My App - Custom Win11 Style Titlebar";
-    SetTextColor(hdc, (DWORD)g_textColor);
-    RECT textRc = { 8, 0, rcWnd.right - 150, TITLEBAR_HEIGHT };
-    SetBkMode(hdc, TRANSPARENT);
-    DrawTextW(hdc, title.c_str(), (int)title.length(), &textRc, DT_VCENTER | DT_SINGLELINE | DT_LEFT);
-
-    // Direct2D でボタンを描画
     float btnIconSize = (float)TITLEBAR_HEIGHT * 0.35f;
     float stroke = 1.6f;
 
+    // ==== 左端にアプリアイコンを描画 ====
+    HICON hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICONSM);
+    if (!hIcon) hIcon = (HICON)GetClassLongPtr(hwnd, GCLP_HICON);
+    if (hIcon) {
+        ICONINFO ii;
+        GetIconInfo(hIcon, &ii);
+        HBITMAP hbmp = ii.hbmColor;
+        BITMAP bmp;
+        if (hbmp && GetObject(hbmp, sizeof(BITMAP), &bmp)) {
+            ID2D1Bitmap* d2dBmp = nullptr;
+            D2D1_SIZE_U size = D2D1::SizeU(bmp.bmWidth, bmp.bmHeight);
+
+            HDC hdc = CreateCompatibleDC(NULL);
+            SelectObject(hdc, hbmp);
+            BITMAPINFO bmi = {};
+            bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+            bmi.bmiHeader.biWidth = bmp.bmWidth;
+            bmi.bmiHeader.biHeight = -bmp.bmHeight;
+            bmi.bmiHeader.biPlanes = 1;
+            bmi.bmiHeader.biBitCount = 32;
+            bmi.bmiHeader.biCompression = BI_RGB;
+
+            void* bits = nullptr;
+            HBITMAP hbmDIB = CreateDIBSection(hdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+            HDC hdcDIB = CreateCompatibleDC(NULL);
+            SelectObject(hdcDIB, hbmDIB);
+            BitBlt(hdcDIB, 0, 0, bmp.bmWidth, bmp.bmHeight, hdc, 0, 0, SRCCOPY);
+
+            D2D1_BITMAP_PROPERTIES bp = {};
+            bp.pixelFormat.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            bp.pixelFormat.alphaMode = D2D1_ALPHA_MODE_PREMULTIPLIED;
+
+            g_pRT->CreateBitmap(D2D1::SizeU(bmp.bmWidth, bmp.bmHeight), bits, bmp.bmWidth * 4, bp, &d2dBmp);
+            if (d2dBmp) {
+                D2D1_RECT_F iconRect = D2D1::RectF(4.0f, 2.0f, 4.0f + TITLEBAR_HEIGHT - 4, 2.0f + TITLEBAR_HEIGHT - 4);
+                g_pRT->DrawBitmap(d2dBmp, iconRect);
+                SafeRelease(d2dBmp);
+            }
+
+            DeleteDC(hdcDIB);
+            DeleteObject(hbmDIB);
+            DeleteDC(hdc);
+        }
+        DeleteObject(ii.hbmColor);
+        DeleteObject(ii.hbmMask);
+    }
+
+    // ==== タイトル文字描画（上下中央） ====
+    std::wstring title = L"My App - Custom Win11 Style Titlebar";
+
+    if (g_pTextFormat && g_pBrushText)
+    {
+        IDWriteTextLayout* pTextLayout = nullptr;
+        g_pDWriteFactory->CreateTextLayout(
+            title.c_str(),
+            (UINT32)title.size(),
+            g_pTextFormat,
+            (FLOAT)(rcWnd.right - TITLEBAR_HEIGHT - 150), // 最大幅
+            (FLOAT)TITLEBAR_HEIGHT,                        // 最大高さ
+            &pTextLayout
+        );
+
+        if (pTextLayout)
+        {
+            DWRITE_TEXT_METRICS metrics;
+            pTextLayout->GetMetrics(&metrics);
+
+            float textTop = (TITLEBAR_HEIGHT - metrics.height) / 2.0f;
+
+            g_pRT->DrawTextLayout(D2D1::Point2F((FLOAT)TITLEBAR_HEIGHT, textTop), pTextLayout, g_pBrushText);
+
+            SafeRelease(pTextLayout);
+        }
+    }
+
+    // ==== ボタン背景描画（Windows11風矩形） ====
+    auto DrawBtnBG = [&](ButtonState& btn, bool isClose) {
+        if (isClose) {
+            if (btn.hover) {
+                ID2D1SolidColorBrush* hoverBrush = nullptr;
+                g_pRT->CreateSolidColorBrush(
+                    D2D1::ColorF(1.0f, 0.0f, 0.0f, btn.pressed ? 0.5f : 0.25f),
+                    &hoverBrush);
+                if (hoverBrush) {
+                    g_pRT->FillRectangle(D2D1::RectF(
+                        (FLOAT)btn.rc.left, (FLOAT)btn.rc.top,
+                        (FLOAT)btn.rc.right, (FLOAT)btn.rc.bottom),
+                        hoverBrush);
+                    SafeRelease(hoverBrush);
+                }
+            }
+        }
+        else {
+            if (btn.hover) {
+                ID2D1Brush* b = btn.pressed ? g_pBrushPressed : g_pBrushHover;
+                g_pRT->FillRectangle(D2D1::RectF(
+                    (FLOAT)btn.rc.left, (FLOAT)btn.rc.top,
+                    (FLOAT)btn.rc.right, (FLOAT)btn.rc.bottom),
+                    b);
+            }
+        }
+        };
+
     // Min
-    if (g_btnMin.hover) {
-        ID2D1Brush* b = g_btnMin.pressed ? g_pBrushPressed : g_pBrushHover;
-        g_pRT->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF((FLOAT)g_btnMin.rc.left, (FLOAT)g_btnMin.rc.top, (FLOAT)g_btnMin.rc.right, (FLOAT)g_btnMin.rc.bottom), 6.0f, 6.0f), b);
-    }
-    DrawMinIcon(g_pRT, D2D1::Point2F((g_btnMin.rc.left + g_btnMin.rc.right) / 2.0f, (g_btnMin.rc.top + g_btnMin.rc.bottom) / 2.0f), btnIconSize, g_pBrushIcon, stroke);
+    DrawBtnBG(g_btnMin, false);
+    DrawMinIcon(g_pRT, D2D1::Point2F((g_btnMin.rc.left + g_btnMin.rc.right) / 2.0f,
+        (g_btnMin.rc.top + g_btnMin.rc.bottom) / 2.0f),
+        btnIconSize, g_pBrushIcon, stroke);
 
-    // Max/Restore
-    if (g_btnMax.hover) {
-        ID2D1Brush* b = g_btnMax.pressed ? g_pBrushPressed : g_pBrushHover;
-        g_pRT->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF((FLOAT)g_btnMax.rc.left, (FLOAT)g_btnMax.rc.top, (FLOAT)g_btnMax.rc.right, (FLOAT)g_btnMax.rc.bottom), 6.0f, 6.0f), b);
+    // Max / Restore
+    DrawBtnBG(g_btnMax, false);
+    if (IsZoomed(hwnd)) {
+        DrawRestoreIcon(g_pRT, D2D1::Point2F((g_btnMax.rc.left + g_btnMax.rc.right) / 2.0f,
+            (g_btnMax.rc.top + g_btnMax.rc.bottom) / 2.0f),
+            btnIconSize, g_pBrushIcon, stroke);
     }
-    DrawRestoreIcon(g_pRT, D2D1::Point2F((g_btnMax.rc.left + g_btnMax.rc.right) / 2.0f, (g_btnMax.rc.top + g_btnMax.rc.bottom) / 2.0f), btnIconSize, g_pBrushIcon, stroke);
-
-    // Close (赤系)
-    if (g_btnClose.hover) {
-        ID2D1SolidColorBrush* rb = nullptr;
-        g_pRT->CreateSolidColorBrush(D2D1::ColorF(0.89f, 0.22f, 0.21f, g_btnClose.pressed ? 0.18f : 0.12f), &rb);
-        g_pRT->FillRoundedRectangle(D2D1::RoundedRect(D2D1::RectF((FLOAT)g_btnClose.rc.left, (FLOAT)g_btnClose.rc.top, (FLOAT)g_btnClose.rc.right, (FLOAT)g_btnClose.rc.bottom), 6.0f, 6.0f), rb);
-        SafeRelease(rb);
+    else {
+        DrawMaxIcon(g_pRT, D2D1::Point2F((g_btnMax.rc.left + g_btnMax.rc.right) / 2.0f,
+            (g_btnMax.rc.top + g_btnMax.rc.bottom) / 2.0f),
+            btnIconSize, g_pBrushIcon, stroke);
     }
-    DrawCloseIcon(g_pRT, D2D1::Point2F((g_btnClose.rc.left + g_btnClose.rc.right) / 2.0f, (g_btnClose.rc.top + g_btnClose.rc.bottom) / 2.0f), btnIconSize, g_pBrushIcon, stroke);
 
+    // Close
+    DrawBtnBG(g_btnClose, true);
+    DrawCloseIcon(g_pRT, D2D1::Point2F((g_btnClose.rc.left + g_btnClose.rc.right) / 2.0f,
+        (g_btnClose.rc.top + g_btnClose.rc.bottom) / 2.0f),
+        btnIconSize,
+        g_btnClose.hover ? g_pBrushText : g_pBrushIcon, stroke);
+
+    // ==== 描画完了 ====
     HRESULT hr = g_pRT->EndDraw();
-    if (hr == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
+    if (hr == D2DERR_RECREATE_TARGET) {
+        DiscardDeviceResources();
+    }
 
     EndPaint(hwnd, &ps);
+}
+
+void ShowSystemMenu(HWND hwnd, POINT pt)
+{
+    HMENU hMenu = GetSystemMenu(hwnd, FALSE);
+    if (!hMenu) return;
+
+    // メニューを表示
+    int cmd = TrackPopupMenu(
+        hMenu,
+        TPM_RETURNCMD | TPM_LEFTBUTTON | TPM_TOPALIGN | TPM_LEFTALIGN,
+        pt.x, pt.y,
+        0,
+        hwnd,
+        NULL
+    );
+    if (cmd) PostMessage(hwnd, WM_SYSCOMMAND, cmd, 0);
 }
 
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -300,6 +450,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         // それ以外はデフォルト（枠やクライアント）
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
+
+    case WM_NCRBUTTONUP: // タイトルバー右クリック
+    {
+        if (wParam == HTCAPTION) // タイトルバー
+        {
+            POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+            ShowSystemMenu(hwnd, pt);
+            return 0;
+        }
+        break;
+    }
+
+    case WM_NCPAINT:
+        // 非クライアント領域の描画を抑制
+        return 0;
+
+    case WM_RBUTTONUP: // クライアント領域でもアイコン右クリックでメニュー
+    {
+        POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        // 左上のアイコン領域
+        RECT rcIcon = { 4, 2, TITLEBAR_HEIGHT, TITLEBAR_HEIGHT };
+        if (PtInRect(&rcIcon, pt)) {
+            ClientToScreen(hwnd, &pt);
+            ShowSystemMenu(hwnd, pt);
+            return 0;
+        }
+        break;
+    }
+
     case WM_MOUSEMOVE:
     {
         POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
@@ -383,13 +562,23 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmd)
     wc.hInstance = hInst;
     wc.lpszClassName = L"Win11CustomFrameClass";
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+	wc.hIcon = LoadIcon(hInst, MAKEINTRESOURCE(IDI_ICON1));
     RegisterClassW(&wc);
 
     // CreateWindowEx で通常ウィンドウを作る（後で WS_CAPTION を消す）
-    HWND hwnd = CreateWindowExW(0, wc.lpszClassName, L"Custom Win11-Style Window", WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, CW_USEDEFAULT, 900, 600, NULL, NULL, hInst, NULL);
+    HWND hwnd = CreateWindowExW(
+        0,
+        wc.lpszClassName,
+        L"Custom Win11-Style Window",
+        WS_OVERLAPPEDWINDOW,  // ← WS_OVERLAPPEDWINDOW ではなく WS_POPUP
+        CW_USEDEFAULT, CW_USEDEFAULT, 900, 600,
+        NULL, NULL, hInst, NULL
+    );
 
     if (!hwnd) return 0;
+
+    MARGINS margins = { 0,0,0,0 };
+    DwmExtendFrameIntoClientArea(hwnd, &margins);
 
     ShowWindow(hwnd, nCmd);
     UpdateWindow(hwnd);
